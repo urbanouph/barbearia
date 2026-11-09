@@ -1,0 +1,40 @@
+# Atualização do login de clientes com Google
+
+Este pacote contém os arquivos para substituir no diretório principal do sistema:
+
+- `auth_social.php` — início e retorno do login Google via OAuth 2.0 / OpenID Connect;
+- `cliente_login.php` — a tela atual do projeto, com exibição de mensagens de erro do login social.
+
+Não há credenciais do Google nem banco de dados neste pacote. Nenhuma alteração SQL é necessária: o fluxo usa os campos `oauth_provider` e `oauth_uid` existentes em `clientes`.
+
+## Instalação
+
+1. Faça uma cópia de segurança dos arquivos atuais `auth_social.php` e `cliente_login.php`.
+2. Extraia os dois arquivos deste pacote na pasta principal do site, substituindo esses arquivos.
+3. Configure no servidor as variáveis de ambiente `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` e `GOOGLE_REDIRECT_URI`.
+4. Use como URI de redirecionamento, sem variações: `https://shiftbarber.com.br/auth_social.php?provider=google`.
+5. No Google Cloud Console, configure o mesmo endereço como URI de redirecionamento autorizado do cliente OAuth Web. Configure também a tela de consentimento e publique/autorize o app conforme o uso pretendido.
+6. Confirme que o PHP do servidor tem PDO MySQL e a extensão cURL habilitados e que o site usa HTTPS.
+7. Teste em janela anônima: abrir a tela de login, escolher Google, autorizar e confirmar o retorno para `agendar.php`.
+
+### XAMPP local
+
+No Apache do XAMPP, as variáveis podem ser definidas na configuração privada do Apache (por exemplo, no VirtualHost usado localmente), dentro do VirtualHost correspondente:
+
+```apache
+SetEnv GOOGLE_CLIENT_ID "SEU_CLIENT_ID"
+SetEnv GOOGLE_CLIENT_SECRET "SEU_NOVO_CLIENT_SECRET"
+SetEnv GOOGLE_REDIRECT_URI "https://shiftbarber.com.br/auth_social.php?provider=google"
+```
+
+Reinicie o Apache depois de alterar a configuração. Para testar em `localhost`, use um cliente OAuth e um URI de retorno separados, cadastrando a URL local exata também no Google Cloud Console.
+
+### Hospedagem do site
+
+Defina as três variáveis no painel/configuração privada da hospedagem, se disponível. Se a hospedagem não permitir variáveis de ambiente, peça ao suporte o método recomendado para guardar segredos fora dos arquivos públicos. Não coloque o segredo em repositório Git, em arquivo acessível pela web, em captura de tela ou em mensagem.
+
+## Segurança importante
+
+Uma chave secreta Google anterior apareceu em código público e numa imagem da conversa. **Revogue-a no Google Cloud Console e gere uma nova antes de habilitar o login.** O pacote não contém nem reutiliza essa chave. Configure o segredo novo apenas no servidor privado.
+
+O retorno verifica o `state` de sessão, usa HTTPS e valida que o Google confirmou o e-mail. Se já existir uma conta com o mesmo e-mail confirmado, o acesso entra nessa conta sem alterar os dados locais. Faça backup e teste antes de aplicar em produção.

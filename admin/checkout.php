@@ -151,9 +151,17 @@ $todosProdutos = $pdo->query("SELECT * FROM produtos WHERE status = 'ativo' AND 
 // Cálculo do Total considerando sessões de pacote já pago
 $ehSessaoPacotePago = !empty($ag['cliente_pacote_id']) || (isset($ag['valor_total']) && (float)$ag['valor_total'] == 0.0);
 $precoServicoPrincipal = $ehSessaoPacotePago ? 0.00 : (float)$ag['servico_preco'];
-$totalComanda = $precoServicoPrincipal;
+$totalComanda = 0.0;
+$principalRepresentadoNosItens = false;
 foreach ($itensExtras as $it) {
+    if ($it['tipo'] === 'servico' && (int)$it['item_id'] === (int)$ag['servico_id'] && !$principalRepresentadoNosItens) {
+        $principalRepresentadoNosItens = true;
+        continue; // O serviço principal já aparece separado na comanda.
+    }
     $totalComanda += (float)$it['subtotal'];
+}
+if (!$principalRepresentadoNosItens) {
+    $totalComanda += $precoServicoPrincipal;
 }
 
 // Agora que todas as regras de redirecionamento foram processadas sem envio prévio, carrega o header HTML
@@ -303,7 +311,8 @@ require_once 'header.php';
                 </tr>
 
                 <!-- Itens Extras Adicionados -->
-                <?php foreach ($itensExtras as $extra): ?>
+                <?php $principalJaExibidoNosItens = false; foreach ($itensExtras as $extra): ?>
+                    <?php if ($extra['tipo'] === 'servico' && (int)$extra['item_id'] === (int)$ag['servico_id'] && !$principalJaExibidoNosItens) { $principalJaExibidoNosItens = true; continue; } ?>
                 <tr class="hover:bg-zinc-800/30 transition">
                     <td class="p-3.5 font-medium text-white"><?= htmlspecialchars($extra['nome_item']) ?></td>
                     <td class="p-3.5">

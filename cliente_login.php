@@ -10,19 +10,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['acao_registro'])) {
     $senha = $_POST['senha'];
     $telefone = trim($_POST['telefone']);
     $cpf = preg_replace('/\D/', '', $_POST['cpf']);
-    $data_nascimento = $_POST['data_nascimento'];
+    $data_nascimento = $_POST['data_nascimento'] ?? '';
+
+    if (strlen($senha) < 8 || strlen($senha) > 72) {
+        $erro = 'A senha precisa ter entre 8 e 72 caracteres.';
+    }
 
     $stmtCheck = $pdo->prepare("SELECT id FROM clientes WHERE email = ? OR cpf = ?");
     $stmtCheck->execute([$email, $cpf]);
     
-    if ($stmtCheck->fetch()) {
+    if ($erro !== '') {
+        // Interrompe o cadastro para corrigir a senha.
+    } elseif ($stmtCheck->fetch()) {
         $erro = "E-mail ou CPF já cadastrado no sistema.";
     } else {
         $stmtInsert = $pdo->prepare("
             INSERT INTO clientes (nome, email, senha, telefone, cpf, data_nascimento, oauth_provider)
             VALUES (?, ?, ?, ?, ?, ?, 'local')
         ");
-        $stmtInsert->execute([$nome, $email, $senha, $telefone, $cpf, $data_nascimento]);
+        $senhaHash = password_hash($senha, PASSWORD_DEFAULT);
+        $stmtInsert->execute([$nome, $email, $senhaHash, $telefone, $cpf, $data_nascimento]);
         $sucesso = "Cadastro realizado com sucesso! Faça login para continuar.";
     }
 }
@@ -35,7 +42,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['acao_login'])) {
     $stmtUser->execute([$email]);
     $cliente = $stmtUser->fetch();
 
-    if ($cliente && $cliente['senha'] === $senha) {
+    $senhaValida = false;
+    if ($cliente && !empty($cliente['senha'])) {
+        $senhaValida = password_verify($senha, $cliente['senha']);
+        // Migra automaticamente senhas antigas em texto puro após um login válido.
+        if (!$senhaValida && hash_equals((string)$cliente['senha'], (string)$senha)) {
+            $hashAtualizado = password_hash($senha, PASSWORD_DEFAULT);
+            $stmtHash = $pdo->prepare("UPDATE clientes SET senha = ? WHERE id = ?");
+            $stmtHash->execute([$hashAtualizado, $cliente['id']]);
+            $senhaValida = true;
+        }
+    }
+
+    if ($senhaValida) {
+        session_regenerate_id(true);
         $_SESSION['cliente_id'] = $cliente['id'];
         $_SESSION['cliente_nome'] = $cliente['nome'];
         $_SESSION['cliente_telefone'] = $cliente['telefone'];
@@ -107,7 +127,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['acao_login'])) {
             </div>
             <div>
                 <label class="block text-xs text-zinc-400 mb-1">Senha</label>
-                <input type="password" name="senha" required class="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-amber-500">
+                <input type="password" name="senha" autocomplete="current-password" required class="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-amber-500">
             </div>
             <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-zinc-950 font-bold py-2.5 rounded-xl text-xs transition">Entrar</button>
         </form>
@@ -140,7 +160,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['acao_login'])) {
             </div>
             <div>
                 <label class="block text-[11px] text-zinc-400 mb-1">Senha</label>
-                <input type="password" name="senha" required class="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-2 text-xs text-white focus:outline-none focus:border-amber-500">
+                <input type="password" name="senha" minlength="8" maxlength="72" required class="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-2 text-xs text-white focus:outline-none focus:border-amber-500">
             </div>
             <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-zinc-950 font-bold py-2.5 rounded-xl text-xs transition mt-2">Criar Conta</button>
         </form>

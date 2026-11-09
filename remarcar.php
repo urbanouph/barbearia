@@ -7,6 +7,10 @@ if (!isset($_SESSION['cliente_id'])) {
 }
 
 $clienteId = (int)$_SESSION['cliente_id'];
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrfToken = $_SESSION['csrf_token'];
 $agendamentoId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
 $erro = '';
 
@@ -24,12 +28,17 @@ if (!$agendamento) {
     exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['salvar_reagendamento'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['salvar_reagendamento']) && !hash_equals($csrfToken, (string)($_POST['csrf_token'] ?? ''))) {
+    $erro = 'Sua sessão expirou. Atualize a página e tente novamente.';
+} elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['salvar_reagendamento'])) {
     $novaData = $_POST['data_agendamento'] ?? '';
     $novoHorario = $_POST['horario'] ?? '';
 
-    if (empty($novaData) || empty($novoHorario)) {
-        $erro = 'Por favor, selecione uma data e um horário disponível.';
+    $dataValida = preg_match('/^\\d{4}-\\d{2}-\\d{2}$/', $novaData) === 1
+        && checkdate((int)substr($novaData, 5, 2), (int)substr($novaData, 8, 2), (int)substr($novaData, 0, 4));
+    $horaValida = preg_match('/^(?:[01]\\d|2[0-3]):[0-5]\\d$/', $novoHorario) === 1;
+    if (!$dataValida || !$horaValida) {
+        $erro = 'Por favor, selecione uma data e um horário disponível válido.';
     } else {
         $duracao = (int)$agendamento['duracao_minutos'];
         $novoInicio = strtotime("$novaData $novoHorario:00");
@@ -37,14 +46,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['salvar_reagendamento'
 
         $diaSemanaNum = (int)date('w', strtotime($novaData));
         $stmtTurnos = $pdo->prepare("
-            SELECT * FROM turnos_atendimento 
+            SELECT * FROM turnos_atendimento
             WHERE (dia_semana = ? OR data_atendimento = ?)
+              AND (profissional_id = ? OR profissional_id IS NULL)
         ");
-        $stmtTurnos->execute([$diaSemanaNum, $novaData]);
+        $stmtTurnos->execute([$diaSemanaNum, $novaData, $agendamento['profissional_id']]);
         $turnos = $stmtTurnos->fetchAll();
 
         $dentroDeTurno = false;
+        $turnoOrdemChegada = false;
         foreach ($turnos as $t) {
+            if (($t['tipo_atendimento'] ?? 'horario_marcado') === 'ordem_chegada') {
+                $turnoOrdemChegada = true;
+                continue;
+            }
             $tIni = strtotime("$novaData {$t['hora_inicio']}");
             $tFim = strtotime("$novaData {$t['hora_fim']}");
             if ($novoInicio >= $tIni && $novoFim <= $tFim) {
@@ -53,7 +68,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['salvar_reagendamento'
             }
         }
 
-        if (!$dentroDeTurno) {
+        if ($turnoOrdemChegada) {
+            $erro = 'Esta data está configurada como Ordem de Chegada. Não é possível reservar ou remarcar um horário nesse dia.';
+        } elseif (!$dentroDeTurno) {
             $erro = 'O horário selecionado não está dentro do expediente desta data.';
         } else {
             $stmtConflito = $pdo->prepare("
@@ -142,6 +159,7 @@ $diasSemanaNomes = [0 => 'Dom', 1 => 'Seg', 2 => 'Ter', 3 => 'Qua', 4 => 'Qui', 
         <?php endif; ?>
 
         <form method="POST" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
             <input type="hidden" id="campoServico" value="<?= $agendamento['servico_id'] ?>">
             <input type="hidden" name="data_agendamento" id="campoData" required>
             <input type="hidden" name="horario" id="horarioSelecionado" required>
@@ -182,7 +200,7 @@ $diasSemanaNomes = [0 => 'Dom', 1 => 'Seg', 2 => 'Ter', 3 => 'Qua', 4 => 'Qui', 
                 <a href="meus_agendamentos.php" class="w-1/3 py-2.5 rounded-xl border border-zinc-700 text-center text-xs text-zinc-400 hover:text-white transition">
                     Voltar
                 </a>
-                <button type="submit" name="salvar_reagendamento" class="w-2/3 bg-amber-500 hover:bg-amber-600 text-zinc-950 font-bold py-2.5 px-4 rounded-xl text-xs transition">
+                <button type="submit" id="botaoConfirmarRemarcacao" name="salvar_reagendamento" disabled class="w-2/3 bg-amber-500 hover:bg-amber-600 text-zinc-950 font-bold py-2.5 px-4 rounded-xl text-xs transition">
                     Confirmar Nova Data
                 </button>
             </div>
@@ -196,6 +214,11 @@ const gradeHorarios = document.getElementById('gradeHorarios');
 const statusCarregamento = document.getElementById('statusCarregamento');
 const horarioSelecionado = document.getElementById('horarioSelecionado');
 const botoesData = document.querySelectorAll('.botao-data');
+const botaoConfirmarRemarcacao = document.getElementById('botaoConfirmarRemarcacao');
+let bloqueioOrdemChegada = false;
+function atualizarBotaoRemarcacao() {
+    botaoConfirmarRemarcacao.disabled = !(campoData.value && horarioSelecionado.value && !bloqueioOrdemChegada);
+}
 
 botoesData.forEach(btn => {
     btn.addEventListener('click', () => {
@@ -221,6 +244,9 @@ botoesData.forEach(btn => {
 });
 
 async function carregarHorarios() {
+    bloqueioOrdemChegada = false;
+    horarioSelecionado.value = '';
+    atualizarBotaoRemarcacao();
     const data = campoData.value;
     const servicoId = campoServico.value;
 
@@ -233,11 +259,19 @@ async function carregarHorarios() {
     statusCarregamento.textContent = 'Buscando vagas disponíveis...';
 
     try {
-        const resposta = await fetch(`horarios_disponiveis.php?data=${data}&servico_id=${servicoId}`);
+        const resposta = await fetch(`horarios_disponiveis.php?data=${encodeURIComponent(data)}&servico_id=${encodeURIComponent(servicoId)}&profissional_id=<?= (int)$agendamento['profissional_id'] ?>`);
         const info = await resposta.json();
 
         if (info.fechado) {
             statusCarregamento.textContent = info.mensagem;
+            return;
+        }
+
+        if (info.ordem_chegada) {
+            bloqueioOrdemChegada = true;
+            horarioSelecionado.value = '';
+            atualizarBotaoRemarcacao();
+            statusCarregamento.textContent = `Modalidade: Ordem de Chegada. ${info.mensagem_ordem || 'Não é possível remarcar para esta data.'}`;
             return;
         }
 
@@ -265,6 +299,7 @@ async function carregarHorarios() {
                 btn.classList.remove('bg-zinc-800', 'text-zinc-200', 'border-zinc-700');
 
                 horarioSelecionado.value = hora;
+                atualizarBotaoRemarcacao();
             });
 
             gradeHorarios.appendChild(btn);

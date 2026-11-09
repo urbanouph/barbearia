@@ -1,0 +1,2 @@
+# Bloqueia acesso direto aos arquivos da pasta de configuração no Apache 2.4+
+Require all denied

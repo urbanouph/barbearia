@@ -10,6 +10,10 @@ if (!isset($_SESSION['cliente_id'])) {
 $clienteLogadoId = (int)$_SESSION['cliente_id'];
 $clienteLogadoNome = $_SESSION['cliente_nome'] ?? '';
 $clienteLogadoTelefone = $_SESSION['cliente_telefone'] ?? '';
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrfToken = $_SESSION['csrf_token'];
 // Atualiza status de pacotes vencidos automaticamente
 $pdo->query("UPDATE cliente_pacotes SET status = 'expirado' WHERE status = 'ativo' AND data_expiracao < CURDATE()");
 
@@ -39,26 +43,45 @@ foreach ($meusPacotesAtivos as $pAtivo) {
 $mensagemSucesso = '';
 $mensagemErro = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento']) && !hash_equals($csrfToken, (string)($_POST['csrf_token'] ?? ''))) {
+    $mensagemErro = 'Sua sessão expirou. Atualize a página e tente novamente.';
+} elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento'])) {
     $clienteNome = trim($_POST['cliente_nome']);
     $clienteTelefone = trim($_POST['cliente_telefone']);
     $profissionalId = !empty($_POST['profissional_id']) ? (int)$_POST['profissional_id'] : null;
     $dataAgendamento = $_POST['data_agendamento'] ?? '';
-    $horario = $_POST['horario'] ?? '';
+    $horario = (string)($_POST['horario'] ?? '');
 
     // Múltiplos serviços selecionados
     $servicosInput = $_POST['servico_id'] ?? '';
-    $servicosIdsSelecionados = array_filter(array_map('intval', explode(',', strval($servicosInput))));
+    $servicosIdsSelecionados = array_values(array_unique(array_filter(array_map('intval', explode(',', strval($servicosInput))), static fn($id) => $id > 0)));
+
+    $produtosQuantidadeInput = $_POST['produto_quantidade'] ?? [];
+    $produtosSolicitados = [];
+    if (is_array($produtosQuantidadeInput)) {
+        foreach ($produtosQuantidadeInput as $produtoIdInput => $quantidadeInput) {
+            $produtoIdInput = (int)$produtoIdInput;
+            $quantidadeInput = (int)$quantidadeInput;
+            if ($produtoIdInput > 0 && $quantidadeInput > 0) {
+                $produtosSolicitados[$produtoIdInput] = $quantidadeInput;
+            }
+        }
+    }
     $servicoId = !empty($servicosIdsSelecionados) ? $servicosIdsSelecionados[0] : 0;
 
-        if (empty($dataAgendamento) || empty($horario)) {
-        $mensagemErro = 'Por favor, selecione uma data e um horário disponível.';
+        $dataValida = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dataAgendamento) === 1
+            && checkdate((int)substr($dataAgendamento, 5, 2), (int)substr($dataAgendamento, 8, 2), (int)substr($dataAgendamento, 0, 4));
+        $horaValida = preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $horario) === 1;
+        if (!$dataValida || !$horaValida) {
+        $mensagemErro = 'Por favor, selecione uma data e um horário válido disponível.';
+    } elseif (!$profissionalId) {
+        $mensagemErro = 'Selecione um profissional para continuar.';
     } elseif (empty($servicosIdsSelecionados)) {
         $mensagemErro = 'Selecione pelo menos um serviço desejado.';
     } else {
         $placeholders = implode(',', array_fill(0, count($servicosIdsSelecionados), '?'));
-        $stmtServs = $pdo->prepare("SELECT id, nome, duracao_minutos, preco, eh_pacote, incompativeis FROM servicos WHERE id IN ($placeholders) AND status = 'ativo'");
-        $stmtServs->execute($servicosIdsSelecionados);
+        $stmtServs = $pdo->prepare("SELECT id, nome, duracao_minutos, preco, eh_pacote, incompativeis FROM servicos WHERE id IN ($placeholders) AND status = 'ativo' AND EXISTS (SELECT 1 FROM profissional_servicos ps JOIN profissionais pr ON pr.id = ps.profissional_id WHERE ps.servico_id = servicos.id AND ps.profissional_id = ? AND pr.status = 'ativo')");
+        $stmtServs->execute(array_merge($servicosIdsSelecionados, [$profissionalId]));
         $servicosEscolhidos = $stmtServs->fetchAll();
 
         if (count($servicosEscolhidos) !== count($servicosIdsSelecionados)) {
@@ -87,10 +110,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento'
 
                 $diaSemanaNum = (int)date('w', strtotime($dataAgendamento));
                 $sqlValidaTurno = "
-                    SELECT * FROM turnos_atendimento 
-                    WHERE (dia_semana = ? OR data_atendimento = ?)
+                    SELECT * FROM turnos_atendimento
+                    WHERE (
+                        (dia_semana = ? AND (data_atendimento IS NULL OR data_atendimento = ?)
+                            AND (? > CURDATE() OR (? = CURDATE() AND hora_fim >= CURTIME())))
+                        OR (data_atendimento = ? AND (data_atendimento > CURDATE() OR (data_atendimento = CURDATE() AND hora_fim >= CURTIME())))
+                    )
                 ";
-                $paramsValidaTurno = [$diaSemanaNum, $dataAgendamento];
+                $paramsValidaTurno = [$diaSemanaNum, $dataAgendamento, $dataAgendamento, $dataAgendamento, $dataAgendamento];
 
                 if ($profissionalId) {
                     $sqlValidaTurno .= " AND (profissional_id = ? OR profissional_id IS NULL)";
@@ -102,10 +129,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento'
                 $turnos = $stmtTurnos->fetchAll();
 
                 $dentroDeTurno = false;
+                $turnoOrdemChegada = false;
                 foreach ($turnos as $t) {
                     if (($t['tipo_atendimento'] ?? 'horario_marcado') === 'ordem_chegada') {
-                        $dentroDeTurno = true;
-                        break;
+                        $turnoOrdemChegada = true;
+                        continue;
                     }
 
                     $tIni = strtotime("$dataAgendamento {$t['hora_inicio']}");
@@ -124,7 +152,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento'
                     }
                 }
 
-                if (!$dentroDeTurno) {
+                if ($turnoOrdemChegada) {
+                    $mensagemErro = 'Nesta data o atendimento é por Ordem de Chegada. Não é possível reservar um horário; compareça à barbearia durante o período informado.';
+                } elseif (!$dentroDeTurno) {
                     $mensagemErro = 'O horário escolhido não está compreendido em nenhum turno válido.';
                 } else {
                     $sqlConflito = "
@@ -157,19 +187,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento'
                     if ($colidiu) {
                         $mensagemErro = 'Este horário com o profissional escolhido já está ocupado.';
                     } else {
-                        $pacoteAtivoExistente = $mapaPacotePorServico[(int)$servicoId] ?? null;
-                        $pacoteUtilizadoId = null;
-                        $valorAgendamento = (float)$servicosEscolhidos[0]['preco'];
-
-                        if ($pacoteAtivoExistente && $pacoteAtivoExistente['sessoes_restantes'] > 0) {
-                            $pacoteUtilizadoId = (int)$pacoteAtivoExistente['id'];
-                            $valorAgendamento = 0.00;
-                        } elseif (!empty($servicosEscolhidos[0]['eh_pacote'])) {
-                            $valorAgendamento = (float)$servicosEscolhidos[0]['preco'];
+                        $pdo->beginTransaction();
+                        try {
+                            $pacoteAtivoExistente = $mapaPacotePorServico[(int)$servicoId] ?? null;
                             $pacoteUtilizadoId = null;
-                        }
+                            $servicoCobertoPorPacote = null;
+                            $valorServicosCobrado = (float)$valorTotalServicos;
+                            $precoServicoPrincipal = 0.0;
+                            foreach ($servicosEscolhidos as $servicoAtual) {
+                                if ((int)$servicoAtual['id'] === (int)$servicoId) {
+                                    $precoServicoPrincipal = (float)$servicoAtual['preco'];
+                                    break;
+                                }
+                            }
 
-                        $stmtInsert = $pdo->prepare("
+                            if ($pacoteAtivoExistente && $pacoteAtivoExistente['sessoes_restantes'] > 0) {
+                                $pacoteUtilizadoId = (int)$pacoteAtivoExistente['id'];
+                                $servicoCobertoPorPacote = (int)$servicoId;
+                                $valorServicosCobrado = max(0, $valorServicosCobrado - $precoServicoPrincipal);
+                            }
+
+                            $produtosEscolhidos = [];
+                            $totalProdutos = 0.0;
+                            $stmtProduto = $pdo->prepare("SELECT id, nome, preco_venda, quantidade_estoque FROM produtos WHERE id = ? AND status = 'ativo' AND mostrar_no_agendamento = 1 FOR UPDATE");
+                            foreach ($produtosSolicitados as $produtoId => $quantidadeProduto) {
+                                $stmtProduto->execute([$produtoId]);
+                                $produto = $stmtProduto->fetch();
+                                if (!$produto || (int)$produto['quantidade_estoque'] < $quantidadeProduto) {
+                                    throw new RuntimeException('Um produto selecionado não está mais disponível na quantidade pedida. Atualize a página e tente novamente.');
+                                }
+                                $produto['quantidade_pedida'] = $quantidadeProduto;
+                                $produtosEscolhidos[] = $produto;
+                                $totalProdutos += (float)$produto['preco_venda'] * $quantidadeProduto;
+                            }
+                            $valorAgendamento = max(0, $valorServicosCobrado + $totalProdutos);
+
+                            $stmtInsert = $pdo->prepare("
                             INSERT INTO agendamentos (cliente_id, profissional_id, cliente_nome, cliente_telefone, servico_id, data_agendamento, horario, status, cliente_pacote_id, valor_total) 
                             VALUES (?, ?, ?, ?, ?, ?, ?, 'pendente', ?, ?)
                         ");
@@ -180,13 +233,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['realizar_agendamento'
                             INSERT INTO agendamento_itens (agendamento_id, tipo, item_id, nome_item, quantidade, preco_unitario, subtotal) 
                             VALUES (?, 'servico', ?, ?, 1, ?, ?)
                         ");
-                        foreach ($servicosEscolhidos as $sItem) {
-                            $precoItem = (float)$sItem['preco'];
-                            $stmtItem->execute([$novoAgendamentoId, $sItem['id'], $sItem['nome'], $precoItem, $precoItem]);
-                        }
+                            foreach ($servicosEscolhidos as $sItem) {
+                                $precoItem = (int)$sItem['id'] === $servicoCobertoPorPacote ? 0.0 : (float)$sItem['preco'];
+                                $stmtItem->execute([$novoAgendamentoId, $sItem['id'], $sItem['nome'], $precoItem, $precoItem]);
+                            }
 
-                        $dataFormatada = date('d/m/Y', strtotime($dataAgendamento));
-                        $mensagemSucesso = "Agendamento marcado com sucesso para o dia <strong>{$dataFormatada}</strong> às <strong>{$horario}</strong> (" . count($servicosEscolhidos) . " serviços)!";
+                            $stmtItemProduto = $pdo->prepare("INSERT INTO agendamento_itens (agendamento_id, tipo, item_id, nome_item, quantidade, preco_unitario, subtotal) VALUES (?, 'produto', ?, ?, ?, ?, ?)");
+                            $stmtBaixaProduto = $pdo->prepare("UPDATE produtos SET quantidade_estoque = quantidade_estoque - ? WHERE id = ? AND status = 'ativo' AND mostrar_no_agendamento = 1 AND quantidade_estoque >= ?");
+                            foreach ($produtosEscolhidos as $produto) {
+                                $qtd = (int)$produto['quantidade_pedida'];
+                                $preco = (float)$produto['preco_venda'];
+                                $stmtBaixaProduto->execute([$qtd, $produto['id'], $qtd]);
+                                if ($stmtBaixaProduto->rowCount() !== 1) {
+                                    throw new RuntimeException('O estoque de um produto mudou durante a reserva. Atualize a página e tente novamente.');
+                                }
+                                $stmtItemProduto->execute([$novoAgendamentoId, $produto['id'], $produto['nome'], $qtd, $preco, $preco * $qtd]);
+                            }
+
+                            $pdo->commit();
+                            $dataFormatada = date('d/m/Y', strtotime($dataAgendamento));
+                            $mensagemSucesso = "Agendamento marcado com sucesso para o dia <strong>{$dataFormatada}</strong> às <strong>{$horario}</strong> (" . count($servicosEscolhidos) . " serviços)!";
+                        } catch (Throwable $e) {
+                            if ($pdo->inTransaction()) {
+                                $pdo->rollBack();
+                            }
+                            $mensagemErro = $e instanceof RuntimeException ? $e->getMessage() : 'Não foi possível concluir o agendamento. Tente novamente.';
+                        }
                     }
                 }
             }
@@ -199,6 +271,7 @@ $profissionais = $pdo->query("SELECT * FROM profissionais WHERE status = 'ativo'
 
 // Buscar todos os serviços ativos
 $todosServicos = $pdo->query("SELECT * FROM servicos WHERE status = 'ativo' ORDER BY nome ASC")->fetchAll();
+$produtosAgendamento = $pdo->query("SELECT id, nome, descricao, preco_venda, quantidade_estoque FROM produtos WHERE status = 'ativo' AND mostrar_no_agendamento = 1 AND quantidade_estoque > 0 ORDER BY nome ASC")->fetchAll();
 
 // Buscar mapa de serviços de cada profissional
 $mapaServicos = [];
@@ -345,7 +418,8 @@ $diasSemanaNomes = [0 => 'Dom', 1 => 'Seg', 2 => 'Ter', 3 => 'Qua', 4 => 'Qui', 
             </div>
         <?php endif; ?>
 
-        <form method="POST" class="space-y-4">
+        <form method="POST" id="formAgendamento" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
             <div>
                 <label class="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">Seu Nome</label>
                 <div class="relative">
@@ -412,6 +486,30 @@ $diasSemanaNomes = [0 => 'Dom', 1 => 'Seg', 2 => 'Ter', 3 => 'Qua', 4 => 'Qui', 
                 </div>
             </div>
 
+            <?php if (!empty($produtosAgendamento)): ?>
+                <section aria-labelledby="tituloProdutosAgendamento" class="rounded-2xl border border-zinc-800 bg-zinc-800/40 p-4 space-y-3">
+                    <div>
+                        <h2 id="tituloProdutosAgendamento" class="text-xs font-bold uppercase tracking-wider text-zinc-200">Produtos disponíveis (opcional)</h2>
+                        <p class="mt-1 text-[11px] text-zinc-400">Escolha o que deseja reservar para o atendimento. A quantidade será conferida no estoque.</p>
+                    </div>
+                    <div class="space-y-2">
+                        <?php foreach ($produtosAgendamento as $produto): ?>
+                            <label class="flex items-center justify-between gap-3 rounded-xl border border-zinc-700 bg-zinc-900/80 p-3">
+                                <span class="min-w-0">
+                                    <span class="block text-xs font-semibold text-white"><?= htmlspecialchars($produto['nome'], ENT_QUOTES, 'UTF-8') ?></span>
+                                    <?php if (!empty($produto['descricao'])): ?><span class="block text-[11px] text-zinc-400 mt-0.5"><?= htmlspecialchars($produto['descricao'], ENT_QUOTES, 'UTF-8') ?></span><?php endif; ?>
+                                    <span class="block text-[11px] text-amber-400 mt-1">R$ <?= number_format((float)$produto['preco_venda'], 2, ',', '.') ?> • <?= (int)$produto['quantidade_estoque'] ?> em estoque</span>
+                                </span>
+                                <span class="shrink-0 text-right">
+                                    <span class="block text-[10px] text-zinc-400 mb-1">Qtd.</span>
+                                    <input type="number" name="produto_quantidade[<?= (int)$produto['id'] ?>]" min="0" max="<?= (int)$produto['quantidade_estoque'] ?>" value="0" aria-label="Quantidade de <?= htmlspecialchars($produto['nome'], ENT_QUOTES, 'UTF-8') ?>" class="w-16 rounded-lg border border-zinc-700 bg-zinc-800 p-1.5 text-center text-xs text-white">
+                                </span>
+                            </label>
+                        <?php endforeach; ?>
+                    </div>
+                </section>
+            <?php endif; ?>
+
             <div>
                 <label class="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">Selecione o Dia</label>
                 <input type="hidden" name="data_agendamento" id="campoData" required>
@@ -448,8 +546,8 @@ $diasSemanaNomes = [0 => 'Dom', 1 => 'Seg', 2 => 'Ter', 3 => 'Qua', 4 => 'Qui', 
                 <div id="gradeHorarios" class="grid grid-cols-4 gap-2 hidden max-h-40 overflow-y-auto p-1"></div>
             </div>
 
-            <button type="submit" name="realizar_agendamento" 
-                class="w-full mt-2 bg-amber-500 hover:bg-amber-600 text-zinc-950 font-bold py-2.5 px-4 rounded-xl text-xs transition flex items-center justify-center gap-2">
+            <button type="submit" id="botaoConfirmarAgendamento" name="realizar_agendamento" disabled
+                class="w-full mt-2 bg-amber-500 hover:bg-amber-600 text-zinc-950 font-bold py-2.5 px-4 rounded-xl text-xs transition flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
                 <i class="fa-solid fa-calendar-plus"></i> Confirmar Agendamento
             </button>
         </form>
@@ -469,9 +567,18 @@ const statusCarregamento = document.getElementById('statusCarregamento');
 const horarioSelecionado = document.getElementById('horarioSelecionado');
 const botoesData = document.querySelectorAll('.botao-data');
 
+const escaparHtml = (valor) => String(valor ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
 // Ao mudar o profissional, filtra os serviços que ele faz
 // Ao mudar o profissional, filtra e renderiza os cards visuais de serviços (Imagem 2)
 let servicosSelecionados = [];
+let bloqueioOrdemChegada = false;
+let requisicaoHorarios = 0;
+const botaoConfirmarAgendamento = document.getElementById('botaoConfirmarAgendamento');
+function atualizarBotaoConfirmar() {
+    const pronto = Boolean(campoProfissional.value && campoServico.value && campoData.value && horarioSelecionado.value && !bloqueioOrdemChegada);
+    botaoConfirmarAgendamento.disabled = !pronto;
+}
 
 // Ao mudar o profissional, filtra e renderiza os cards visuais de serviços com suporte a seleção múltipla e regras de incompatibilidade
 campoProfissional.addEventListener('change', () => {
@@ -508,21 +615,22 @@ campoProfissional.addEventListener('change', () => {
             const pac = mapaPacotesAtivos[s.id] || null;
             const ehPacoteAtivo = (pac && pac.sessoes_restantes > 0);
             
-            const temImagem = (s.imagem && typeof s.imagem === 'string' && s.imagem.trim() !== '');
+            const imagemUrl = (typeof s.imagem === 'string') ? s.imagem.trim() : '';
+            const temImagem = imagemUrl !== '' && !/^javascript:/i.test(imagemUrl);
             const imgHtml = temImagem 
-                ? `<img src="${s.imagem.trim()}" alt="${s.nome}" 
+                ? `<img src="${escaparHtml(imagemUrl)}" alt="${escaparHtml(s.nome)}" 
                         onerror="this.remove()" 
                         class="w-14 h-14 sm:w-16 sm:h-16 rounded-xl object-cover shrink-0 border border-zinc-700/60 bg-zinc-800 shadow-sm">` 
                 : '';
 
             let descricaoTexto = s.descricao && s.descricao.trim() !== '' 
-                ? s.descricao 
+                ? escaparHtml(s.descricao) 
                 : (s.eh_pacote == 1 ? `Pacote com ${s.sessoes_pacote} sessões válidas por ${s.validade_dias} dias.` : 'Atendimento personalizado com padrão de qualidade.');
 
             const card = document.createElement('div');
             card.className = 'card-servico-item bg-zinc-900/90 hover:bg-zinc-800/80 border border-zinc-800 rounded-2xl p-3 cursor-pointer transition flex items-center justify-between gap-3 shadow group select-none';
             card.setAttribute('data-id', s.id);
-            card.setAttribute('data-nome', s.nome);
+            card.setAttribute('data-nome', String(s.nome ?? ''));
 
             let tagTipo = (s.eh_pacote == 1) 
                 ? '<span class="bg-amber-500/10 text-amber-400 border border-amber-500/20 px-2 py-0.5 rounded-md text-[10px] font-bold">🎁 Pacote</span>' 
@@ -550,7 +658,7 @@ campoProfissional.addEventListener('change', () => {
                 <div class="flex items-center gap-3 min-w-0">
                     ${imgHtml}
                     <div class="min-w-0">
-                        <h4 class="text-xs sm:text-sm font-bold text-white group-hover:text-amber-400 transition truncate">${s.nome}</h4>
+                        <h4 class="text-xs sm:text-sm font-bold text-white group-hover:text-amber-400 transition truncate">${escaparHtml(s.nome)}</h4>
                         <p class="text-[11px] text-zinc-400 line-clamp-1 mt-0.5">${descricaoTexto}</p>
                         <div class="flex items-center gap-2 mt-1">
                             <span class="text-[11px] text-zinc-400 flex items-center gap-1 font-medium">
@@ -712,22 +820,27 @@ botoesData.forEach(btn => {
 });
 
 async function carregarHorarios() {
+    const requisicaoAtual = ++requisicaoHorarios;
+    bloqueioOrdemChegada = false;
+    horarioSelecionado.value = '';
+    atualizarBotaoConfirmar();
     const data = campoData.value;
     const servicoId = campoServico.value;
 
     if (!data) {
         statusCarregamento.textContent = 'Clique num dos dias disponíveis acima.';
         gradeHorarios.classList.add('hidden');
+        atualizarBotaoConfirmar();
         return;
     }
 
     if (!servicoId) {
         statusCarregamento.textContent = 'Selecione primeiro o serviço desejado.';
         gradeHorarios.classList.add('hidden');
+        atualizarBotaoConfirmar();
         return;
     }
 
-    horarioSelecionado.value = '';
     gradeHorarios.innerHTML = '';
     gradeHorarios.classList.add('hidden');
     statusCarregamento.classList.remove('hidden');
@@ -735,15 +848,21 @@ async function carregarHorarios() {
 
     try {
         const profId = campoProfissional.value;
-        const resposta = await fetch(`horarios_disponiveis.php?data=${data}&servico_id=${servicoId}&servicos_ids=${servicoId}&profissional_id=${profId}`);
+        const resposta = await fetch(`horarios_disponiveis.php?data=${encodeURIComponent(data)}&servico_id=${encodeURIComponent(servicoId)}&servicos_ids=${encodeURIComponent(servicoId)}&profissional_id=${encodeURIComponent(profId)}`);
         const info = await resposta.json();
+        if (requisicaoAtual !== requisicaoHorarios) return;
 
         if (info.fechado) {
+            horarioSelecionado.value = '';
+            atualizarBotaoConfirmar();
             statusCarregamento.textContent = info.mensagem;
             return;
         }
 
         if (info.ordem_chegada) {
+            bloqueioOrdemChegada = true;
+            horarioSelecionado.value = '';
+            atualizarBotaoConfirmar();
             statusCarregamento.classList.remove('hidden');
             statusCarregamento.innerHTML = `
                 <div class="bg-blue-950/40 border border-blue-800/80 p-3 rounded-xl text-blue-300 text-xs flex items-center gap-2">
@@ -754,13 +873,14 @@ async function carregarHorarios() {
                     </div>
                 </div>
             `;
-            horarioSelecionado.value = info.horario_padrao || '09:00';
             gradeHorarios.classList.add('hidden');
             return;
         }
 
         if (!info.horarios || info.horarios.length === 0) {
             statusCarregamento.textContent = 'Sem vagas livres para a duração deste corte nesta data.';
+            horarioSelecionado.value = '';
+            atualizarBotaoConfirmar();
             return;
         }
 
@@ -783,11 +903,15 @@ async function carregarHorarios() {
                 btn.classList.remove('bg-zinc-800', 'text-zinc-200', 'border-zinc-700');
 
                 horarioSelecionado.value = hora;
+                atualizarBotaoConfirmar();
             });
 
             gradeHorarios.appendChild(btn);
         });
     } catch (e) {
+        if (requisicaoAtual !== requisicaoHorarios) return;
+        horarioSelecionado.value = '';
+        atualizarBotaoConfirmar();
         statusCarregamento.textContent = 'Erro ao consultar horários disponíveis.';
     }
 }

@@ -2,11 +2,22 @@
 require_once '../config/database.php';
 verificarAutenticacao();
 
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrfToken = $_SESSION['csrf_token'];
+$csrfValido = $_SERVER['REQUEST_METHOD'] !== 'POST' || hash_equals($csrfToken, (string)($_POST['csrf_token'] ?? ''));
+
 $mensagemSucesso = '';
 $mensagemErro = '';
+if (!$csrfValido) {
+    $mensagemErro = 'Sua sessão expirou. Atualize a página e tente novamente.';
+}
 
 if (isset($_GET['sucesso_prod'])) {
     $mensagemSucesso = "Produto cadastrado com sucesso!";
+} elseif (isset($_GET['sucesso_edicao'])) {
+    $mensagemSucesso = "Produto atualizado com sucesso!";
 } elseif (isset($_GET['sucesso_estoque'])) {
     $mensagemSucesso = "Estoque atualizado!";
 } elseif (isset($_GET['sucesso_venda'])) {
@@ -14,29 +25,44 @@ if (isset($_GET['sucesso_prod'])) {
 }
 
 // 1. Cadastrar Novo Produto
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['cadastrar_produto'])) {
-    $nome = trim($_POST['nome']);
-    $precoCusto = (float)$_POST['preco_custo'];
-    $precoVenda = (float)$_POST['preco_venda'];
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $csrfValido && isset($_POST['cadastrar_produto'])) {
+    $nome = trim((string)($_POST['nome'] ?? ''));
+    $precoCusto = (float)($_POST['preco_custo'] ?? 0);
+    $precoVenda = (float)($_POST['preco_venda'] ?? 0);
     $comissao = (float)($_POST['comissao_percentual'] ?? 10.00);
-    $estoque = (int)$_POST['quantidade_estoque'];
+    $estoque = (int)($_POST['quantidade_estoque'] ?? 0);
     $estoqueMinimo = (int)($_POST['estoque_minimo'] ?? 5);
+    $mostrarNoAgendamento = isset($_POST['mostrar_no_agendamento']) ? 1 : 0;
 
-    if (!empty($nome) && $precoVenda > 0) {
+    if ($nome !== '' && strlen($nome) <= 100 && $precoCusto >= 0 && $precoVenda > 0 && $comissao >= 0 && $comissao <= 100 && $estoque >= 0 && $estoqueMinimo >= 0) {
         $stmt = $pdo->prepare("
-            INSERT INTO produtos (nome, preco_custo, preco_venda, comissao_percentual, quantidade_estoque, estoque_minimo) 
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO produtos (nome, preco_custo, preco_venda, comissao_percentual, quantidade_estoque, estoque_minimo, mostrar_no_agendamento) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         ");
-        $stmt->execute([$nome, $precoCusto, $precoVenda, $comissao, $estoque, $estoqueMinimo]);
+        $stmt->execute([$nome, $precoCusto, $precoVenda, $comissao, $estoque, $estoqueMinimo, $mostrarNoAgendamento]);
         header('Location: produtos.php?sucesso_prod=1');
         exit;
     } else {
-        $mensagemErro = "Preencha o nome e um preço de venda válido.";
+        $mensagemErro = "Informe um nome de até 100 caracteres, preços válidos e quantidades não negativas.";
     }
 }
 
-// 2. Ajustar Estoque Rápido (+ ou -)
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajustar_estoque'])) {
+// 2. Editar nome e disponibilidade do produto no agendamento
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $csrfValido && isset($_POST['editar_produto'])) {
+    $produtoId = (int)($_POST['produto_id'] ?? 0);
+    $nome = trim((string)($_POST['nome'] ?? ''));
+    $mostrar = isset($_POST['mostrar_no_agendamento']) ? 1 : 0;
+    if ($produtoId > 0 && $nome !== '' && strlen($nome) <= 100) {
+        $stmt = $pdo->prepare("UPDATE produtos SET nome = ?, mostrar_no_agendamento = ? WHERE id = ? AND status = 'ativo'");
+        $stmt->execute([$nome, $mostrar, $produtoId]);
+        header('Location: produtos.php?sucesso_edicao=1');
+        exit;
+    }
+    $mensagemErro = 'Informe um nome válido para o produto.';
+}
+
+// 3. Ajustar Estoque Rápido (+ ou -)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $csrfValido && isset($_POST['ajustar_estoque'])) {
     $produtoId = (int)$_POST['produto_id'];
     $novaQuantidade = (int)$_POST['nova_quantidade'];
 
@@ -49,10 +75,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajustar_estoque'])) {
 }
 
 // 3. Registrar Venda no Balcão (PDV) com Cliente e Vendedor (suporta anônimo)
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['registrar_venda'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $csrfValido && isset($_POST['registrar_venda'])) {
     $produtoId = (int)$_POST['venda_produto_id'];
     $quantidade = (int)$_POST['venda_quantidade'];
     $formaPagamento = $_POST['forma_pagamento'] ?? 'pix';
+    if (!in_array($formaPagamento, ['dinheiro', 'pix', 'cartao_credito', 'cartao_debito'], true)) {
+        $formaPagamento = 'pix';
+    }
     
     // Vendedor: ID do profissional ou NULL se Anônimo
     $profissionalId = !empty($_POST['venda_profissional_id']) ? (int)$_POST['venda_profissional_id'] : null;
@@ -107,11 +136,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['registrar_venda'])) {
     }
 }
 
-// 4. Excluir Produto
-if (isset($_GET['excluir_prod'])) {
-    $id = (int)$_GET['excluir_prod'];
-    $stmt = $pdo->prepare("UPDATE produtos SET status = 'inativo' WHERE id = ?");
-    $stmt->execute([$id]);
+// 4. Desativar produto por POST (não executar ações destrutivas via link GET)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $csrfValido && isset($_POST['desativar_produto'])) {
+    $id = (int)($_POST['produto_id'] ?? 0);
+    if ($id > 0) {
+        $stmt = $pdo->prepare("UPDATE produtos SET status = 'inativo' WHERE id = ?");
+        $stmt->execute([$id]);
+    }
     header('Location: produtos.php');
     exit;
 }
@@ -206,6 +237,7 @@ require_once 'header.php';
         </div>
 
         <form method="POST" id="formVendaPdv" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 
                 <!-- BUSCA E SELEÇÃO DE CLIENTE (COM OPÇÃO ANÔNIMO) -->
@@ -314,6 +346,7 @@ require_once 'header.php';
         </div>
 
         <form method="POST" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3.5">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
             <div class="sm:col-span-2">
                 <label class="block text-xs font-semibold text-zinc-400 mb-1">Nome do Produto</label>
                 <input type="text" name="nome" placeholder="Ex: Pomada Efeito Matte 80g" required 
@@ -344,6 +377,12 @@ require_once 'header.php';
                        class="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-amber-500">
             </div>
 
+            <div class="sm:col-span-2 md:col-span-5">
+                <label class="inline-flex items-center gap-2 text-xs text-zinc-300">
+                    <input type="checkbox" name="mostrar_no_agendamento" value="1" class="accent-amber-500 w-4 h-4">
+                    Mostrar este produto como opcional no agendamento (somente com estoque disponível)
+                </label>
+            </div>
             <div class="md:col-span-5 flex justify-end">
                 <button type="submit" name="cadastrar_produto" 
                         class="bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-white font-bold py-2.5 px-6 rounded-xl text-xs transition flex items-center gap-2">
@@ -361,7 +400,7 @@ require_once 'header.php';
         </div>
 
         <div class="overflow-x-auto overflow-y-hidden w-full scroll-suave">
-            <table class="w-full text-left border-collapse min-w-[700px]">
+            <table class="w-full text-left border-collapse min-w-[900px]">
                 <thead>
                     <tr class="border-b border-zinc-800 text-zinc-400 text-xs uppercase tracking-wider">
                         <th class="p-3.5">Produto</th>
@@ -375,14 +414,29 @@ require_once 'header.php';
                 </thead>
                 <tbody class="divide-y divide-zinc-800 text-xs">
                     <?php if (empty($produtos)): ?>
-                        <tr><td colspan="6" class="p-6 text-center text-zinc-500">Nenhum produto cadastrado.</td></tr>
+                        <tr><td colspan="7" class="p-6 text-center text-zinc-500">Nenhum produto cadastrado.</td></tr>
                     <?php endif; ?>
 
                     <?php foreach ($produtos as $p): 
                         $alerta = $p['quantidade_estoque'] <= $p['estoque_minimo'];
                     ?>
                     <tr class="hover:bg-zinc-800/30 transition">
-                        <td class="p-3.5 font-bold text-white"><?= htmlspecialchars($p['nome']) ?></td>
+                        <td class="p-3.5">
+                            <form method="POST" class="flex min-w-[230px] items-center gap-2">
+                                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
+                                <input type="hidden" name="produto_id" value="<?= (int)$p['id'] ?>">
+                                <div class="min-w-0 flex-1 space-y-1.5">
+                                    <input type="text" name="nome" value="<?= htmlspecialchars($p['nome'], ENT_QUOTES, 'UTF-8') ?>" maxlength="100" required aria-label="Nome do produto" class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs text-white">
+                                    <label class="flex items-center gap-1.5 text-[10px] text-zinc-400">
+                                        <input type="checkbox" name="mostrar_no_agendamento" value="1" <?= !empty($p['mostrar_no_agendamento']) ? 'checked' : '' ?> class="accent-amber-500">
+                                        Mostrar no agendamento
+                                    </label>
+                                </div>
+                                <button type="submit" name="editar_produto" value="1" title="Salvar nome e exibição" class="bg-zinc-800 hover:bg-zinc-700 text-amber-400 p-2 rounded-lg border border-zinc-700">
+                                    <i class="fa-solid fa-floppy-disk"></i>
+                                </button>
+                            </form>
+                        </td>
                         <td class="p-3.5 text-zinc-400">R$ <?= number_format($p['preco_custo'], 2, ',', '.') ?></td>
                         <td class="p-3.5 font-semibold text-amber-400">R$ <?= number_format($p['preco_venda'], 2, ',', '.') ?></td>
                         <td class="p-3.5 text-emerald-400 font-bold"><?= number_format($p['comissao_percentual'] ?? 10, 1, ',', '.') ?>%</td>
@@ -402,16 +456,17 @@ require_once 'header.php';
                         </td>
                         <td class="p-3.5 text-right">
                             <form method="POST" class="inline-flex items-center gap-1.5">
-                                <input type="hidden" name="produto_id" value="<?= $p['id'] ?>">
+                                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
+                                <input type="hidden" name="produto_id" value="<?= (int)$p['id'] ?>">
                                 <input type="number" name="nova_quantidade" value="<?= $p['quantidade_estoque'] ?>" min="0" 
                                        class="w-16 bg-zinc-800 border border-zinc-700 rounded-lg p-1 text-center text-xs text-white">
                                 <button type="submit" name="ajustar_estoque" class="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 p-1.5 rounded-lg border border-zinc-700" title="Atualizar Estoque">
                                     <i class="fa-solid fa-floppy-disk"></i>
                                 </button>
-                                <a href="produtos.php?excluir_prod=<?= $p['id'] ?>" onclick="return confirm('Deseja desativar este produto?');" 
-                                   class="text-zinc-500 hover:text-red-400 p-1.5 rounded-lg ml-1" title="Remover Produto">
+                                <button type="submit" name="desativar_produto" value="1" onclick="return confirm('Deseja desativar este produto?');"
+                                   class="text-zinc-500 hover:text-red-400 p-1.5 rounded-lg ml-1" title="Desativar Produto">
                                     <i class="fa-solid fa-trash"></i>
-                                </a>
+                                </button>
                             </form>
                         </td>
                     </tr>

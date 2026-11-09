@@ -16,12 +16,46 @@ if (isset($_GET['sucesso_turno'])) {
 
 // Atualizar status de agendamento (com PRG)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['atualizar_status'])) {
-    $agendamentoId = (int)$_POST['agendamento_id'];
-    $novoStatus = $_POST['status'];
-    $stmt = $pdo->prepare("UPDATE agendamentos SET status = ? WHERE id = ?");
-    $stmt->execute([$novoStatus, $agendamentoId]);
-    header('Location: agendamentos.php?sucesso_status=1');
-    exit;
+    $agendamentoId = (int)($_POST['agendamento_id'] ?? 0);
+    $novoStatus = (string)($_POST['status'] ?? '');
+    $statusPermitidos = ['pendente', 'confirmado', 'concluido', 'cancelado'];
+    if (!in_array($novoStatus, $statusPermitidos, true) || $agendamentoId <= 0) {
+        $mensagemErro = 'Status ou agendamento inválido.';
+    } else {
+        try {
+            $pdo->beginTransaction();
+            $stmtEstado = $pdo->prepare("SELECT status FROM agendamentos WHERE id = ? FOR UPDATE");
+            $stmtEstado->execute([$agendamentoId]);
+            $estadoAnterior = $stmtEstado->fetchColumn();
+            if ($estadoAnterior === false) {
+                throw new RuntimeException('Agendamento não encontrado.');
+            }
+            if ($estadoAnterior === 'cancelado' && $novoStatus !== 'cancelado') {
+                throw new RuntimeException('Um agendamento cancelado não pode ser reativado por esta ação.');
+            }
+            if ($novoStatus === 'cancelado' && $estadoAnterior !== 'cancelado') {
+                if ($estadoAnterior === 'concluido') {
+                    throw new RuntimeException('Um atendimento concluído não pode ser cancelado por esta ação.');
+                }
+                $stmtProdutos = $pdo->prepare("SELECT item_id, SUM(quantidade) AS quantidade FROM agendamento_itens WHERE agendamento_id = ? AND tipo = 'produto' GROUP BY item_id");
+                $stmtProdutos->execute([$agendamentoId]);
+                $stmtDevolve = $pdo->prepare("UPDATE produtos SET quantidade_estoque = quantidade_estoque + ? WHERE id = ?");
+                foreach ($stmtProdutos->fetchAll() as $itemProduto) {
+                    $stmtDevolve->execute([(int)$itemProduto['quantidade'], (int)$itemProduto['item_id']]);
+                }
+            }
+            $stmt = $pdo->prepare("UPDATE agendamentos SET status = ? WHERE id = ?");
+            $stmt->execute([$novoStatus, $agendamentoId]);
+            $pdo->commit();
+            header('Location: agendamentos.php?sucesso_status=1');
+            exit;
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            $mensagemErro = $e instanceof RuntimeException ? $e->getMessage() : 'Não foi possível atualizar o agendamento.';
+        }
+    }
 }
 
 // Cadastrar/Atualizar escala semanal do profissional

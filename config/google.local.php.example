@@ -1,0 +1,10 @@
+<?php
+/**
+ * Exemplo local para o XAMPP. Copie para google.local.php e preencha.
+ * O arquivo real google.local.php é ignorado pelo Git e deve ficar privado.
+ */
+return [
+    'client_id' => 'COLE_AQUI_O_ID_DO_CLIENTE_GOOGLE',
+    'client_secret' => 'COLE_AQUI_O_NOVO_SEGREDO_GOOGLE',
+    'redirect_uri' => 'http://localhost/barbearia/auth_social.php?provider=google',
+];

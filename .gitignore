@@ -1,0 +1,2 @@
+# Credenciais privadas locais; nunca enviar ao Git ou incluir em publicação
+/config/google.local.php

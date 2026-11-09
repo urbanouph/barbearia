@@ -7,6 +7,10 @@ if (!isset($_SESSION['cliente_id'])) {
 }
 
 $clienteId = (int)$_SESSION['cliente_id'];
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrfToken = $_SESSION['csrf_token'];
 
 // Busca pacotes do cliente
 $pdo->query("UPDATE cliente_pacotes SET status = 'expirado' WHERE status = 'ativo' AND data_expiracao < CURDATE()");
@@ -23,15 +27,40 @@ $meusPacotes = $stmtMeusPacotes->fetchAll();
 $mensagem = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['cancelar_agendamento'])) {
-    $agendamentoId = (int)$_POST['agendamento_id'];
-    
-    $stmtCancela = $pdo->prepare("
-        UPDATE agendamentos 
-        SET status = 'cancelado' 
-        WHERE id = ? AND cliente_id = ? AND status = 'pendente'
-    ");
-    $stmtCancela->execute([$agendamentoId, $clienteId]);
-    $mensagem = "Agendamento cancelado com sucesso.";
+    $agendamentoId = (int)($_POST['agendamento_id'] ?? 0);
+    if (!hash_equals($csrfToken, (string)($_POST['csrf_token'] ?? ''))) {
+        $mensagem = 'Sua sessão expirou. Atualize a página e tente novamente.';
+    } else {
+        try {
+            $pdo->beginTransaction();
+            $stmtEstado = $pdo->prepare("SELECT status FROM agendamentos WHERE id = ? AND cliente_id = ? FOR UPDATE");
+            $stmtEstado->execute([$agendamentoId, $clienteId]);
+            $estado = $stmtEstado->fetchColumn();
+            if ($estado !== 'pendente') {
+                throw new RuntimeException('Este agendamento não pode mais ser cancelado por esta tela.');
+            }
+
+            $stmtProdutos = $pdo->prepare("SELECT item_id, SUM(quantidade) AS quantidade FROM agendamento_itens WHERE agendamento_id = ? AND tipo = 'produto' GROUP BY item_id");
+            $stmtProdutos->execute([$agendamentoId]);
+            $stmtDevolve = $pdo->prepare("UPDATE produtos SET quantidade_estoque = quantidade_estoque + ? WHERE id = ?");
+            foreach ($stmtProdutos->fetchAll() as $itemProduto) {
+                $stmtDevolve->execute([(int)$itemProduto['quantidade'], (int)$itemProduto['item_id']]);
+            }
+
+            $stmtCancela = $pdo->prepare("UPDATE agendamentos SET status = 'cancelado' WHERE id = ? AND cliente_id = ? AND status = 'pendente'");
+            $stmtCancela->execute([$agendamentoId, $clienteId]);
+            if ($stmtCancela->rowCount() !== 1) {
+                throw new RuntimeException('Não foi possível confirmar o cancelamento. Atualize a página e tente novamente.');
+            }
+            $pdo->commit();
+            $mensagem = 'Agendamento cancelado com sucesso. Os produtos reservados voltaram ao estoque.';
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            $mensagem = $e instanceof RuntimeException ? $e->getMessage() : 'Não foi possível cancelar agora. Tente novamente.';
+        }
+    }
 }
 
 $stmt = $pdo->prepare("
@@ -140,6 +169,7 @@ $meusAgendamentos = $stmt->fetchAll();
                                 </a>
 
                                 <form method="POST" onsubmit="return confirm('Deseja realmente cancelar este horário?');">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
                                     <input type="hidden" name="agendamento_id" value="<?= $ag['id'] ?>">
                                     <button type="submit" name="cancelar_agendamento" class="text-[11px] text-red-400 hover:text-red-300 border border-red-900/50 hover:bg-red-950/30 px-2.5 py-1 rounded-lg transition">
                                         Cancelar

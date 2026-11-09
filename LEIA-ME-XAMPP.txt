@@ -1,0 +1,10 @@
+SHIFT BARBER — PACOTE PARA TESTE NO XAMPP
+
+1. Faça uma cópia de segurança dos arquivos do projeto e do banco antes de substituir qualquer coisa.
+2. Extraia a pasta barbearia em C:\xampp\htdocs\barbearia. Preserve config\database.php se já ajustou a conexão.
+3. Em um banco existente, selecione barbearia_db no phpMyAdmin e importe migracao_produtos_agendamento.sql UMA ÚNICA VEZ. Se a coluna já existir, não repita a migração.
+4. Em instalação nova, use database.sql; ele já inclui a coluna. Não importe database2.sql: o dump com dados pessoais foi excluído deste pacote.
+5. Abra http://localhost:85/barbearia/. No painel, acesse Frente de Caixa & Controle de Estoque, edite ou cadastre um produto e marque Mostrar no agendamento.
+6. Produtos sem estoque não são oferecidos. A reserva separa o estoque; se o cliente cancelar enquanto estiver pendente, a quantidade retorna ao estoque.
+
+Pacote baseado na branch pública main; sem banco de produção nem credenciais privadas. Teste primeiro em cópia local.

@@ -132,8 +132,12 @@ CREATE TABLE IF NOT EXISTS produtos (
     quantidade_estoque INT NOT NULL DEFAULT 0,
     estoque_minimo INT NOT NULL DEFAULT 5,
     status ENUM('ativo', 'inativo') DEFAULT 'ativo',
+    mostrar_no_agendamento TINYINT(1) NOT NULL DEFAULT 0,
     criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Mantém compatibilidade ao executar o esquema em instalações existentes
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS mostrar_no_agendamento TINYINT(1) NOT NULL DEFAULT 0 AFTER status;
 
 -- Tabela de Vendas de Produtos (Frente de Caixa / PDV)
 CREATE TABLE IF NOT EXISTS vendas_produtos (
